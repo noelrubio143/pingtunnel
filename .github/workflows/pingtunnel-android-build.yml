@@ -1,0 +1,80 @@
+# Builds a no-root libpingtunnel.so for AMBERV2RAY's existing ABIs
+# (armeabi-v7a, arm64-v8a), straight from the OFFICIAL esrrhs/pingtunnel
+# repo -- no fork/patch needed, the no-root fix (icmp_listen_android.go,
+# upstream commit 699904d+) is already merged into mainline master.
+#
+# Drop this file in a repo under .github/workflows/, push, then run it
+# from the Actions tab (phone browser works fine, same as you already
+# do for slipstream-plugin-android). Download the "libpingtunnel-so"
+# artifact when it finishes and drop the two files into
+# AMBERV2RAY/app/src/main/jniLibs/<abi>/libpingtunnel.so
+
+name: Build pingtunnel (no-root) for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      pingtunnel_commit:
+        description: "esrrhs/pingtunnel commit/tag to build (must include icmp_listen_android.go)"
+        required: false
+        default: "master"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Install Android NDK
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SM" ]; then
+            SM=$(find "$SDK" -path '*/cmdline-tools/*/bin/sdkmanager' | sort | tail -1)
+          fi
+          yes | "$SM" --licenses >/dev/null || true
+          NDK_PKG=$("$SM" --list 2>/dev/null | awk '/^[[:space:]]*ndk;/{print $1}' | sort -V | tail -1)
+          echo "Installing $NDK_PKG"
+          "$SM" --install "$NDK_PKG"
+          VER="${NDK_PKG#ndk;}"
+          echo "ANDROID_NDK_HOME=$SDK/ndk/$VER" >> "$GITHUB_ENV"
+
+      - name: Clone pingtunnel (official, upstream)
+        run: |
+          git clone https://github.com/esrrhs/pingtunnel.git pingtunnel-src
+          cd pingtunnel-src
+          git checkout "${{ github.event.inputs.pingtunnel_commit }}"
+          go get github.com/esrrhs/gohome@latest
+          go mod tidy
+
+      - name: Cross-compile for armeabi-v7a and arm64-v8a
+        run: |
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir -p out/armeabi-v7a out/arm64-v8a
+          BUILD_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          GIT_COMMIT="$(git -C pingtunnel-src rev-parse --short HEAD)"
+          LDFLAGS="-s -w -X 'github.com/esrrhs/pingtunnel.BuildTime=$BUILD_TIME' -X 'github.com/esrrhs/pingtunnel.GitCommit=$GIT_COMMIT' -X 'github.com/esrrhs/pingtunnel.GitBranch=android' -extldflags=-Wl,-z,max-page-size=16384"
+
+          cd pingtunnel-src/cmd
+
+          echo "==> armeabi-v7a (arm)"
+          CC="$TOOLCHAIN/armv7a-linux-androideabi26-clang" \
+          GOOS=android GOARCH=arm CGO_ENABLED=1 \
+          go build -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/out/armeabi-v7a/libpingtunnel.so" .
+
+          echo "==> arm64-v8a (arm64)"
+          CC="$TOOLCHAIN/aarch64-linux-android26-clang" \
+          GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
+          go build -trimpath -ldflags "$LDFLAGS" -o "$GITHUB_WORKSPACE/out/arm64-v8a/libpingtunnel.so" .
+
+          ls -lh "$GITHUB_WORKSPACE"/out/*/libpingtunnel.so
+
+      - name: Upload libpingtunnel.so (both ABIs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: libpingtunnel-so
+          path: out/**/libpingtunnel.so
